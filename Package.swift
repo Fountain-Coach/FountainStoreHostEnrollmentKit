@@ -7,8 +7,13 @@ let package = Package(
     products: [
         .library(name: "FountainStoreHostEnrollmentKit", targets: ["FountainStoreHostEnrollmentKit"])
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0")
+    ],
     targets: [
-        .target(name: "FountainStoreHostEnrollmentKit"),
+        .target(name: "FountainStoreHostEnrollmentKit", dependencies: [
+            .product(name: "Crypto", package: "swift-crypto")
+        ]),
         .testTarget(name: "FountainStoreHostEnrollmentKitTests", dependencies: ["FountainStoreHostEnrollmentKit"])
     ]
 )
