@@ -9,3 +9,7 @@ The deterministic service is a contract fixture only. Its passing tests do not e
 host-agent readiness, TLS, production deployment, or external security review.
 
 Status: candidate / locally tested; not released or publicly admitted.
+
+The candidate also defines signed bootstrap descriptors and a provider-neutral `HostAgentTransport` boundary. The
+deterministic transport verifies signatures, expiry, exact target, host identity, artifact digest, idempotency, and
+revocation while performing no network or provider operation.

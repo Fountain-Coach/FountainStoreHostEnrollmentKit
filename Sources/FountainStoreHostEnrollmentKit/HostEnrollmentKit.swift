@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public struct SecretStoreReference: Codable, Equatable, Sendable {
     public let service: String
@@ -177,6 +178,177 @@ public enum HostEnrollmentRefusal: Error, Equatable, Sendable {
     case scopeInsufficient
     case notEnrollable
     case revoked
+}
+
+public struct BootstrapDescriptor: Codable, Equatable, Sendable {
+    public let protocolVersion: String
+    public let target: String
+    public let provider: String
+    public let hostIdentity: String
+    public let agentArtifactVersion: String
+    public let agentArtifactDigest: String
+    public let enrollmentEndpoint: URL
+    public let enrollmentChallengeReference: String
+    public let expiresAt: Date
+
+    public init(protocolVersion: String = "fountainstore-host/1", target: String, provider: String,
+                hostIdentity: String, agentArtifactVersion: String, agentArtifactDigest: String,
+                enrollmentEndpoint: URL, enrollmentChallengeReference: String, expiresAt: Date) {
+        self.protocolVersion = protocolVersion
+        self.target = target
+        self.provider = provider
+        self.hostIdentity = hostIdentity
+        self.agentArtifactVersion = agentArtifactVersion
+        self.agentArtifactDigest = agentArtifactDigest
+        self.enrollmentEndpoint = enrollmentEndpoint
+        self.enrollmentChallengeReference = enrollmentChallengeReference
+        self.expiresAt = expiresAt
+    }
+
+    public func canonicalBytes() throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(self)
+    }
+}
+
+public struct SignedBootstrapDescriptor: Codable, Equatable, Sendable {
+    public let descriptor: BootstrapDescriptor
+    public let signerFingerprint: String
+    public let signature: Data
+
+    public init(descriptor: BootstrapDescriptor, signerFingerprint: String, signature: Data) {
+        self.descriptor = descriptor
+        self.signerFingerprint = signerFingerprint
+        self.signature = signature
+    }
+
+    public func verify(using publicKey: Curve25519.Signing.PublicKey) throws -> Bool {
+        publicKey.isValidSignature(signature, for: try descriptor.canonicalBytes())
+    }
+}
+
+public struct HostAgentRequest: Codable, Equatable, Sendable {
+    public enum Operation: String, Codable, Sendable {
+        case status
+        case install
+        case rollback
+        case rotate
+        case revoke
+    }
+
+    public let operation: Operation
+    public let operationVersion: String
+    public let target: String
+    public let hostIdentity: String
+    public let artifactDigest: String?
+    public let credentialReference: SecretStoreReference
+    public let idempotencyKey: String
+    public let expiresAt: Date
+
+    public init(operation: Operation, operationVersion: String = "1", target: String, hostIdentity: String,
+                artifactDigest: String? = nil, credentialReference: SecretStoreReference,
+                idempotencyKey: String, expiresAt: Date) {
+        self.operation = operation
+        self.operationVersion = operationVersion
+        self.target = target
+        self.hostIdentity = hostIdentity
+        self.artifactDigest = artifactDigest
+        self.credentialReference = credentialReference
+        self.idempotencyKey = idempotencyKey
+        self.expiresAt = expiresAt
+    }
+}
+
+public struct HostAgentReceipt: Codable, Equatable, Sendable {
+    public let operation: HostAgentRequest.Operation
+    public let target: String
+    public let hostIdentity: String
+    public let state: HostLifecycleState
+    public let artifactDigest: String?
+    public let evidence: [String]
+
+    public init(operation: HostAgentRequest.Operation, target: String, hostIdentity: String,
+                state: HostLifecycleState, artifactDigest: String? = nil, evidence: [String] = []) {
+        self.operation = operation
+        self.target = target
+        self.hostIdentity = hostIdentity
+        self.state = state
+        self.artifactDigest = artifactDigest
+        self.evidence = evidence
+    }
+}
+
+public protocol HostAgentTransport: Sendable {
+    func send(_ request: HostAgentRequest) async throws -> HostAgentReceipt
+}
+
+public enum HostAgentTransportRefusal: Error, Equatable, Sendable {
+    case expired
+    case replayed
+    case targetMismatch
+    case identityMismatch
+    case descriptorInvalid
+    case descriptorExpired
+    case artifactMismatch
+    case unavailable
+    case revoked
+}
+
+/// Deterministic host-agent boundary. It verifies a signed descriptor and models authenticated operation state;
+/// it deliberately performs no HTTP, TLS, provider, SSH, Keychain, or filesystem operation.
+public actor DeterministicHostAgentTransport: HostAgentTransport {
+    private let descriptor: SignedBootstrapDescriptor
+    private let trustedKey: Curve25519.Signing.PublicKey
+    private let expectedArtifactDigest: String
+    private var idempotencyKeys: Set<String> = []
+    private var state: HostLifecycleState = .enrolled
+
+    public init(descriptor: SignedBootstrapDescriptor, trustedKey: Curve25519.Signing.PublicKey,
+                expectedArtifactDigest: String) {
+        self.descriptor = descriptor
+        self.trustedKey = trustedKey
+        self.expectedArtifactDigest = expectedArtifactDigest
+    }
+
+    public func validateDescriptor(now: Date) throws {
+        guard try descriptor.verify(using: trustedKey) else { throw HostAgentTransportRefusal.descriptorInvalid }
+        guard descriptor.descriptor.expiresAt > now else { throw HostAgentTransportRefusal.descriptorExpired }
+    }
+
+    public func send(_ request: HostAgentRequest) async throws -> HostAgentReceipt {
+        try validateDescriptor(now: Date())
+        guard request.expiresAt > Date() else { throw HostAgentTransportRefusal.expired }
+        guard request.target == descriptor.descriptor.target else { throw HostAgentTransportRefusal.targetMismatch }
+        guard request.hostIdentity == descriptor.descriptor.hostIdentity else { throw HostAgentTransportRefusal.identityMismatch }
+        guard idempotencyKeys.insert(request.idempotencyKey).inserted else { throw HostAgentTransportRefusal.replayed }
+
+        switch request.operation {
+        case .status:
+            guard state != .revoked else { throw HostAgentTransportRefusal.revoked }
+            state = .ready
+        case .install:
+            guard request.artifactDigest == expectedArtifactDigest else { throw HostAgentTransportRefusal.artifactMismatch }
+            guard state != .revoked else { throw HostAgentTransportRefusal.revoked }
+            state = .ready
+        case .rollback:
+            guard state != .revoked else { throw HostAgentTransportRefusal.revoked }
+            state = .enrolled
+        case .rotate:
+            guard state != .revoked else { throw HostAgentTransportRefusal.revoked }
+            state = .enrolled
+        case .revoke:
+            state = .revoked
+        }
+        return HostAgentReceipt(
+            operation: request.operation,
+            target: request.target,
+            hostIdentity: request.hostIdentity,
+            state: state,
+            artifactDigest: request.artifactDigest,
+            evidence: ["fixture:signed-descriptor", "fixture:exact-target", "fixture:agent-operation"])
+    }
 }
 
 /// Deterministic lifecycle authority for contract and fixture tests. It deliberately has no network, provider,

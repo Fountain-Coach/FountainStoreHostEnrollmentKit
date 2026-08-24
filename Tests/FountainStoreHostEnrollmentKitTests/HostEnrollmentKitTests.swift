@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 @testable import FountainStoreHostEnrollmentKit
 
 final class HostEnrollmentKitTests: XCTestCase {
@@ -104,5 +105,94 @@ final class HostEnrollmentKitTests: XCTestCase {
         XCTAssertFalse(encoded.localizedCaseInsensitiveContains("privateKey"))
         XCTAssertFalse(encoded.localizedCaseInsensitiveContains("credentialValue"))
         XCTAssertFalse(encoded.localizedCaseInsensitiveContains("ssh"))
+    }
+
+    func testSignedBootstrapDescriptorVerifiesCanonicalPayload() throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let descriptor = BootstrapDescriptor(
+            target: "server:staging-1",
+            provider: "hetzner-cloud",
+            hostIdentity: "hetzner:server:staging-1",
+            agentArtifactVersion: "0.5.0-staging",
+            agentArtifactDigest: "sha256:agent",
+            enrollmentEndpoint: URL(string: "https://staging.example.test/enroll")!,
+            enrollmentChallengeReference: "challenge-ref-1",
+            expiresAt: now.addingTimeInterval(100))
+        let signed = SignedBootstrapDescriptor(
+            descriptor: descriptor,
+            signerFingerprint: "SHA256:fixture-signer",
+            signature: try privateKey.signature(for: descriptor.canonicalBytes()))
+        XCTAssertTrue(try signed.verify(using: privateKey.publicKey))
+
+        let changed = BootstrapDescriptor(
+            target: descriptor.target,
+            provider: descriptor.provider,
+            hostIdentity: descriptor.hostIdentity,
+            agentArtifactVersion: descriptor.agentArtifactVersion,
+            agentArtifactDigest: "sha256:changed",
+            enrollmentEndpoint: descriptor.enrollmentEndpoint,
+            enrollmentChallengeReference: descriptor.enrollmentChallengeReference,
+            expiresAt: descriptor.expiresAt)
+        let tampered = SignedBootstrapDescriptor(
+            descriptor: changed,
+            signerFingerprint: signed.signerFingerprint,
+            signature: signed.signature)
+        XCTAssertFalse(try tampered.verify(using: privateKey.publicKey))
+    }
+
+    func testHostAgentTransportEnforcesDescriptorTargetArtifactAndRevocation() async throws {
+        let privateKey = Curve25519.Signing.PrivateKey()
+        let current = Date()
+        let descriptor = BootstrapDescriptor(
+            target: "server:staging-1",
+            provider: "hetzner-cloud",
+            hostIdentity: "hetzner:server:staging-1",
+            agentArtifactVersion: "0.5.0-staging",
+            agentArtifactDigest: "sha256:agent",
+            enrollmentEndpoint: URL(string: "https://staging.example.test/enroll")!,
+            enrollmentChallengeReference: "challenge-ref-1",
+            expiresAt: current.addingTimeInterval(100))
+        let signed = SignedBootstrapDescriptor(
+            descriptor: descriptor,
+            signerFingerprint: "SHA256:fixture-signer",
+            signature: try privateKey.signature(for: descriptor.canonicalBytes()))
+        let transport = DeterministicHostAgentTransport(
+            descriptor: signed, trustedKey: privateKey.publicKey, expectedArtifactDigest: "sha256:agent")
+        let reference = SecretStoreReference(service: "fountain-coach", account: "staging-host")
+        let request = HostAgentRequest(
+            operation: .install,
+            target: descriptor.target,
+            hostIdentity: descriptor.hostIdentity,
+            artifactDigest: "sha256:agent",
+            credentialReference: reference,
+            idempotencyKey: "agent-install-1",
+            expiresAt: current.addingTimeInterval(100))
+        let receipt = try await transport.send(request)
+        XCTAssertEqual(receipt.state, .ready)
+        XCTAssertTrue(receipt.evidence.contains("fixture:signed-descriptor"))
+
+        do {
+            _ = try await transport.send(HostAgentRequest(
+                operation: .install, target: "server:wrong", hostIdentity: descriptor.hostIdentity,
+                artifactDigest: "sha256:agent", credentialReference: reference,
+                idempotencyKey: "agent-install-2", expiresAt: current.addingTimeInterval(100)))
+            XCTFail("wrong target must refuse")
+        } catch let refusal as HostAgentTransportRefusal {
+            XCTAssertEqual(refusal, .targetMismatch)
+        }
+
+        _ = try await transport.send(HostAgentRequest(
+            operation: .revoke, target: descriptor.target, hostIdentity: descriptor.hostIdentity,
+            credentialReference: reference, idempotencyKey: "agent-revoke-1",
+            expiresAt: current.addingTimeInterval(100)))
+        do {
+            _ = try await transport.send(HostAgentRequest(
+                operation: .status, target: descriptor.target, hostIdentity: descriptor.hostIdentity,
+                credentialReference: reference, idempotencyKey: "agent-status-1",
+                expiresAt: current.addingTimeInterval(100)))
+            XCTFail("revoked host must refuse status")
+        } catch let refusal as HostAgentTransportRefusal {
+            XCTAssertEqual(refusal, .revoked)
+        }
     }
 }
