@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "FountainStoreHostEnrollmentKit",
-    platforms: [.macOS(.v14), .iOS(.v17)],
+    platforms: [.macOS(.v13), .iOS(.v16)],
     products: [
         .library(name: "FountainStoreHostEnrollmentKit", targets: ["FountainStoreHostEnrollmentKit"])
     ],
