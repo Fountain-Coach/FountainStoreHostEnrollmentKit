@@ -5,8 +5,30 @@ import CryptoKit
 final class HostEnrollmentKitTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000)
 
+    private struct FixtureValueProvider: FountainStoreCredentialValueProvider {
+        let value: Data
+        func retrieve(_ reference: SecretStoreReference) async throws -> Data { value }
+    }
+
+    private actor FixtureRemoteTransport: FountainStoreRemoteCredentialProvisionTransport {
+        var received: Data?
+
+        func send(_ request: FountainStoreRemoteCredentialProvisionRequest,
+                  credential: Data) async throws -> FountainStoreCredentialProvisionReceipt {
+            received = credential
+            return FountainStoreCredentialProvisionReceipt(
+                target: request.target,
+                secretReference: request.remoteSecretReference,
+                state: .remoteProvisioned,
+                credentialFingerprint: request.credentialFingerprint,
+                evidence: ["fixture:authenticated-host", "fixture:remote-secretstore-stored", "credential:value-not-returned"])
+        }
+    }
+
     func testCredentialProvisionInstrumentHasStableFCISIdentityAndRedactedReceipt() throws {
         XCTAssertEqual(FountainStoreCredentialProvisionInstrument.identity, "fountainstore.credential.provision")
+        XCTAssertEqual(FountainStoreCredentialProvisionInstrument.semanticVersion, "0.2.0")
+        XCTAssertEqual(FountainStoreCredentialProvisionInstrument.remoteProvisionOperation, "fountainstore.credential.provision.remote")
         XCTAssertEqual(FountainStoreCredentialProvisionInstrument.owningOrganization, "Fountain-Coach")
         XCTAssertEqual(FountainStoreCredentialProvisionInstrument.owningKit, "FountainStoreHostEnrollmentKit")
 
@@ -22,6 +44,31 @@ final class HostEnrollmentKitTests: XCTestCase {
         XCTAssertFalse(encoded.localizedCaseInsensitiveContains("credentialValue"))
         XCTAssertFalse(encoded.localizedCaseInsensitiveContains("privateKey"))
         XCTAssertFalse(encoded.contains("secret-value"))
+    }
+
+    func testRemoteCredentialProvisionerHandsOffOnlyInMemoryAndReturnsTerminalRedactedReceipt() async throws {
+        let credential = Data("opaque-credential-fixture".utf8)
+        let transport = FixtureRemoteTransport()
+        let adapter = FountainStoreRemoteCredentialProvisionAdapter(
+            valueProvider: FixtureValueProvider(value: credential), transport: transport)
+        let request = FountainStoreRemoteCredentialProvisionRequest(
+            target: "root@65.109.14.71",
+            hostIdentity: "fountainstore:production",
+            localSecretReference: SecretStoreReference(service: "com.fountain.store.http", account: "FS_API_KEY"),
+            remoteSecretReference: SecretStoreReference(service: "com.fountain.store.http", account: "FS_API_KEY"),
+            credentialFingerprint: "sha256:fixture",
+            idempotencyKey: "remote-provision-1",
+            expiresAt: Date().addingTimeInterval(60))
+
+        let receipt = await adapter.provision(request)
+        XCTAssertEqual(receipt.state, .remoteProvisioned)
+        XCTAssertTrue(receipt.terminal)
+        XCTAssertEqual(receipt.credentialFingerprint, "sha256:fixture")
+        let encoded = String(decoding: try JSONEncoder().encode(receipt), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("opaque-credential-fixture"))
+        XCTAssertFalse(encoded.localizedCaseInsensitiveContains("credentialValue"))
+        let received = await transport.received
+        XCTAssertEqual(received, credential)
     }
 
     private func makeService() -> DeterministicHostEnrollmentService {
