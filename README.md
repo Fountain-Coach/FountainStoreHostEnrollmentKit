@@ -2,7 +2,8 @@
 
 Provider-neutral FCIS-KIT contracts and deterministic lifecycle fixture for Chapter 97 host bootstrap and enrollment.
 
-The package also owns the FCIS-KIT instrument contract `fountainstore.credential.provision` (v0.2.0). It defines
+The package also owns the FCIS-KIT instrument contracts `fountainstore.credential.provision` (v0.2.0) and
+`fountainstore.credential.seed` (v0.1.0). The seed instrument defines
 the request, terminal receipt, scenario, and Swift URLSession transport for handing an opaque FountainStore
 credential to an authenticated remote host-agent. Generation and custody remain host-adapter responsibilities;
 credential values are never Codable, MIDI2, receipts, telemetry, or logs.

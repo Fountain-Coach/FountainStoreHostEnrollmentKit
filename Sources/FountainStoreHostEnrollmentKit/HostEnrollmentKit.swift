@@ -1,7 +1,7 @@
 import Foundation
 import Crypto
 
-public struct SecretStoreReference: Codable, Equatable, Sendable {
+public struct SecretStoreReference: Codable, Equatable, Hashable, Sendable {
     public let service: String
     public let account: String
 

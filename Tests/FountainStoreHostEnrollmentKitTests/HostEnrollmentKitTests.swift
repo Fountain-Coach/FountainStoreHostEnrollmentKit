@@ -50,6 +50,43 @@ final class HostEnrollmentKitTests: XCTestCase {
         }
     }
 
+    private final class FixtureSeedStore: FountainStoreCredentialSeedStore, @unchecked Sendable {
+        var values: [SecretStoreReference: Data] = [:]
+
+        func contains(_ reference: SecretStoreReference) throws -> Bool {
+            values[reference] != nil
+        }
+
+        func storeGeneratedCredential(byteCount: Int, for reference: SecretStoreReference) throws -> String {
+            var generator = SystemRandomNumberGenerator()
+            let value = Data((0..<byteCount).map { _ in UInt8.random(in: UInt8.min...UInt8.max, using: &generator) })
+            values[reference] = value
+            return "sha256:" + SHA256.hash(data: value).map { String(format: "%02x", $0) }.joined()
+        }
+    }
+
+    func testCredentialSeedIsOneTimeAndNeverReturnsTheValue() throws {
+        let store = FixtureSeedStore()
+        let request = FountainStoreCredentialSeedRequest(
+            target: "server:production",
+            hostIdentity: "fountainstore:production",
+            secretReference: SecretStoreReference(service: "fountainstore-host-agent", account: "production-host-agent"),
+            idempotencyKey: "seed-1",
+            expiresAt: now.addingTimeInterval(60))
+        let receipt = try FountainStoreCredentialSeeder(store: store).seed(request, now: now)
+        XCTAssertEqual(receipt.state, .seeded)
+        XCTAssertTrue(receipt.evidence.contains("credential:value-not-returned"))
+        XCTAssertEqual(store.values[request.secretReference]?.count, 32)
+        do {
+            _ = try FountainStoreCredentialSeeder(store: store).seed(request, now: now)
+            XCTFail("seed must not rotate an existing host credential")
+        } catch let error as FountainStoreCredentialSeedError {
+            XCTAssertEqual(error, .alreadySeeded)
+        }
+        let encoded = String(decoding: try JSONEncoder().encode(receipt), as: UTF8.self)
+        XCTAssertFalse(encoded.contains("credentialValue"))
+    }
+
     func testCredentialProvisionInstrumentHasStableFCISIdentityAndRedactedReceipt() throws {
         XCTAssertEqual(FountainStoreCredentialProvisionInstrument.identity, "fountainstore.credential.provision")
         XCTAssertEqual(FountainStoreCredentialProvisionInstrument.semanticVersion, "0.2.0")
