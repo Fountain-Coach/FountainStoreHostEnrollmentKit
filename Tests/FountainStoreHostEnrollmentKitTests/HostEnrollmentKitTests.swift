@@ -1,21 +1,46 @@
 import XCTest
+import Foundation
 import CryptoKit
 @testable import FountainStoreHostEnrollmentKit
+
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
+private final class FixtureURLProtocol: URLProtocol {
+    nonisolated(unsafe) static var handler: ((URLRequest) -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        guard let handler = Self.handler, let client else { return }
+        let (response, body) = handler(request)
+        client.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client.urlProtocol(self, didLoad: body)
+        client.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
 
 final class HostEnrollmentKitTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000)
 
     private struct FixtureValueProvider: FountainStoreCredentialValueProvider {
-        let value: Data
-        func retrieve(_ reference: SecretStoreReference) async throws -> Data { value }
+        let values: [String: Data]
+        func retrieve(_ reference: SecretStoreReference) async throws -> Data {
+            values[reference.service + ":" + reference.account] ?? Data()
+        }
     }
 
     private actor FixtureRemoteTransport: FountainStoreRemoteCredentialProvisionTransport {
-        var received: Data?
+        var receivedCredential: Data?
+        var receivedHostCredential: Data?
 
         func send(_ request: FountainStoreRemoteCredentialProvisionRequest,
-                  credential: Data) async throws -> FountainStoreCredentialProvisionReceipt {
-            received = credential
+                  credential: Data,
+                  hostCredential: Data) async throws -> FountainStoreCredentialProvisionReceipt {
+            receivedCredential = credential
+            receivedHostCredential = hostCredential
             return FountainStoreCredentialProvisionReceipt(
                 target: request.target,
                 secretReference: request.remoteSecretReference,
@@ -48,13 +73,18 @@ final class HostEnrollmentKitTests: XCTestCase {
 
     func testRemoteCredentialProvisionerHandsOffOnlyInMemoryAndReturnsTerminalRedactedReceipt() async throws {
         let credential = Data("opaque-credential-fixture".utf8)
+        let hostCredential = Data("host-agent-credential-fixture".utf8)
         let transport = FixtureRemoteTransport()
         let adapter = FountainStoreRemoteCredentialProvisionAdapter(
-            valueProvider: FixtureValueProvider(value: credential), transport: transport)
+            valueProvider: FixtureValueProvider(values: [
+                "com.fountain.store.http:FS_API_KEY": credential,
+                "fountain-coach:production-host-agent": hostCredential
+            ]), transport: transport)
         let request = FountainStoreRemoteCredentialProvisionRequest(
             target: "root@65.109.14.71",
             hostIdentity: "fountainstore:production",
             localSecretReference: SecretStoreReference(service: "com.fountain.store.http", account: "FS_API_KEY"),
+            hostSecretReference: SecretStoreReference(service: "fountain-coach", account: "production-host-agent"),
             remoteSecretReference: SecretStoreReference(service: "com.fountain.store.http", account: "FS_API_KEY"),
             credentialFingerprint: "sha256:fixture",
             idempotencyKey: "remote-provision-1",
@@ -67,8 +97,49 @@ final class HostEnrollmentKitTests: XCTestCase {
         let encoded = String(decoding: try JSONEncoder().encode(receipt), as: UTF8.self)
         XCTAssertFalse(encoded.contains("opaque-credential-fixture"))
         XCTAssertFalse(encoded.localizedCaseInsensitiveContains("credentialValue"))
-        let received = await transport.received
+        let received = await transport.receivedCredential
         XCTAssertEqual(received, credential)
+        let receivedHostCredential = await transport.receivedHostCredential
+        XCTAssertEqual(receivedHostCredential, hostCredential)
+    }
+
+    func testURLSessionTransportUsesTypedEndpointAndTransportOnlyCredentialHeaders() async throws {
+        let credential = Data("store-secret".utf8)
+        let hostCredential = Data("host-secret".utf8)
+        let remoteReference = SecretStoreReference(service: "com.fountain.store.http", account: "FS_API_KEY")
+        let request = FountainStoreRemoteCredentialProvisionRequest(
+            target: "root@65.109.14.71",
+            hostIdentity: "fountainstore:production",
+            localSecretReference: remoteReference,
+            hostSecretReference: SecretStoreReference(service: "fountain-coach", account: "production-host-agent"),
+            remoteSecretReference: remoteReference,
+            credentialFingerprint: "sha256:fixture",
+            idempotencyKey: "urlsession-provision-1",
+            expiresAt: Date().addingTimeInterval(60))
+        let receipt = FountainStoreCredentialProvisionReceipt(
+            target: request.target, secretReference: request.remoteSecretReference,
+            state: .remoteProvisioned, credentialFingerprint: request.credentialFingerprint,
+            evidence: ["credential:value-not-returned"])
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [FixtureURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        FixtureURLProtocol.handler = { urlRequest in
+            XCTAssertEqual(urlRequest.url?.path, "/agent/v1/provision-credential")
+            XCTAssertEqual(urlRequest.httpMethod, "POST")
+            XCTAssertEqual(urlRequest.value(forHTTPHeaderField: FountainStoreRemoteCredentialProvisionURLSessionTransport.hostCredentialHeader), hostCredential.base64EncodedString())
+            XCTAssertEqual(urlRequest.value(forHTTPHeaderField: FountainStoreRemoteCredentialProvisionURLSessionTransport.storeCredentialHeader), credential.base64EncodedString())
+            let body = String(decoding: urlRequest.httpBody ?? Data(), as: UTF8.self)
+            XCTAssertFalse(body.contains("store-secret"))
+            XCTAssertFalse(body.contains("host-secret"))
+            return (HTTPURLResponse(url: urlRequest.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, try! JSONEncoder().encode(receipt))
+        }
+        defer { FixtureURLProtocol.handler = nil }
+
+        let transport = try FountainStoreRemoteCredentialProvisionURLSessionTransport(
+            endpoint: URL(string: "https://store.example.test/agent/v1/provision-credential")!, session: session)
+        let result = try await transport.send(request, credential: credential, hostCredential: hostCredential)
+        XCTAssertEqual(result, receipt)
     }
 
     private func makeService() -> DeterministicHostEnrollmentService {

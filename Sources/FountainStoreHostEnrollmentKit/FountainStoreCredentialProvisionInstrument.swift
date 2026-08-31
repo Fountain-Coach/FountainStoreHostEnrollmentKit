@@ -1,5 +1,9 @@
 import Foundation
 
+#if canImport(FoundationNetworking)
+import FoundationNetworking
+#endif
+
 /// The FCIS-KIT instrument that provisions the opaque credential used by a FountainStore session.
 ///
 /// The kit owns identity and protocol semantics. A host adapter owns credential generation and custody;
@@ -77,6 +81,7 @@ public struct FountainStoreRemoteCredentialProvisionRequest: Codable, Equatable,
     public let target: String
     public let hostIdentity: String
     public let localSecretReference: SecretStoreReference
+    public let hostSecretReference: SecretStoreReference
     public let remoteSecretReference: SecretStoreReference
     public let credentialFingerprint: String
     public let idempotencyKey: String
@@ -84,12 +89,14 @@ public struct FountainStoreRemoteCredentialProvisionRequest: Codable, Equatable,
 
     public init(target: String, hostIdentity: String,
                 localSecretReference: SecretStoreReference,
+                hostSecretReference: SecretStoreReference,
                 remoteSecretReference: SecretStoreReference,
                 credentialFingerprint: String,
                 idempotencyKey: String, expiresAt: Date) {
         self.target = target
         self.hostIdentity = hostIdentity
         self.localSecretReference = localSecretReference
+        self.hostSecretReference = hostSecretReference
         self.remoteSecretReference = remoteSecretReference
         self.credentialFingerprint = credentialFingerprint
         self.idempotencyKey = idempotencyKey
@@ -108,7 +115,8 @@ public protocol FountainStoreCredentialValueProvider: Sendable {
 /// zeroization policy; the kit owns only the contract and lifecycle result.
 public protocol FountainStoreRemoteCredentialProvisionTransport: Sendable {
     func send(_ request: FountainStoreRemoteCredentialProvisionRequest,
-              credential: Data) async throws -> FountainStoreCredentialProvisionReceipt
+              credential: Data,
+              hostCredential: Data) async throws -> FountainStoreCredentialProvisionReceipt
 }
 
 /// FCIS-KIT adapter for the two-leg operation: retrieve the local credential through
@@ -133,10 +141,14 @@ public struct FountainStoreRemoteCredentialProvisionAdapter: Sendable {
         }
         do {
             let credential = try await valueProvider.retrieve(request.localSecretReference)
+            let hostCredential = try await valueProvider.retrieve(request.hostSecretReference)
             guard !credential.isEmpty else {
                 return refusal(request, evidence: ["secretstore:source-empty"])
             }
-            return try await transport.send(request, credential: credential)
+            guard !hostCredential.isEmpty else {
+                return refusal(request, evidence: ["secretstore:host-credential-empty"])
+            }
+            return try await transport.send(request, credential: credential, hostCredential: hostCredential)
         } catch {
             return refusal(request, evidence: ["credential:remote-handoff-failed"])
         }
@@ -151,4 +163,91 @@ public struct FountainStoreRemoteCredentialProvisionAdapter: Sendable {
             credentialFingerprint: request.credentialFingerprint,
             evidence: evidence + ["credential:value-not-returned"])
     }
+}
+
+/// Swift URLSession transport for the production FountainStore host-agent boundary.
+///
+/// The endpoint is supplied by the admitted host configuration; this transport does not
+/// discover, construct, or guess a remote route. The typed request is JSON, while both
+/// credential values remain transport-only headers and are never Codable, MIDI2, receipts,
+/// or telemetry. The host-agent is responsible for authenticating the host credential and
+/// storing the store credential under `remoteSecretReference`.
+public struct FountainStoreRemoteCredentialProvisionURLSessionTransport: FountainStoreRemoteCredentialProvisionTransport, @unchecked Sendable {
+    public static let hostCredentialHeader = "X-Fountain-Host-Credential"
+    public static let storeCredentialHeader = "X-Fountain-Store-Credential"
+
+    private let endpoint: URL
+    private let session: URLSession
+    private let timeout: TimeInterval
+
+    public init(endpoint: URL, session: URLSession = .shared, timeout: TimeInterval = 30) throws {
+        guard endpoint.scheme?.lowercased() == "https", endpoint.host != nil else {
+            throw FountainStoreRemoteCredentialProvisionTransportError.invalidEndpoint
+        }
+        guard timeout > 0 else {
+            throw FountainStoreRemoteCredentialProvisionTransportError.invalidTimeout
+        }
+        self.endpoint = endpoint
+        self.session = session
+        self.timeout = timeout
+    }
+
+    public func send(_ request: FountainStoreRemoteCredentialProvisionRequest,
+                     credential: Data,
+                     hostCredential: Data) async throws -> FountainStoreCredentialProvisionReceipt {
+        guard !credential.isEmpty, !hostCredential.isEmpty else {
+            throw FountainStoreRemoteCredentialProvisionTransportError.emptyCredential
+        }
+
+        var urlRequest = URLRequest(url: endpoint)
+        urlRequest.httpMethod = "POST"
+        urlRequest.timeoutInterval = timeout
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        urlRequest.setValue(hostCredential.base64EncodedString(), forHTTPHeaderField: Self.hostCredentialHeader)
+        urlRequest.setValue(credential.base64EncodedString(), forHTTPHeaderField: Self.storeCredentialHeader)
+        urlRequest.httpBody = try JSONEncoder().encode(request)
+
+        let (body, response): (Data, URLResponse)
+        do {
+            (body, response) = try await session.data(for: urlRequest)
+        } catch {
+            throw FountainStoreRemoteCredentialProvisionTransportError.requestFailed
+        }
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw FountainStoreRemoteCredentialProvisionTransportError.invalidResponse
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw FountainStoreRemoteCredentialProvisionTransportError.httpStatus(httpResponse.statusCode)
+        }
+
+        let receipt: FountainStoreCredentialProvisionReceipt
+        do {
+            receipt = try JSONDecoder().decode(FountainStoreCredentialProvisionReceipt.self, from: body)
+        } catch {
+            throw FountainStoreRemoteCredentialProvisionTransportError.invalidReceipt
+        }
+        guard receipt.instrumentIdentity == FountainStoreCredentialProvisionInstrument.identity,
+              receipt.instrumentVersion == FountainStoreCredentialProvisionInstrument.semanticVersion,
+              receipt.target == request.target,
+              receipt.secretReference == request.remoteSecretReference,
+              receipt.credentialFingerprint == request.credentialFingerprint,
+              receipt.state == .remoteProvisioned,
+              receipt.terminal,
+              receipt.evidence.contains("credential:value-not-returned") else {
+            throw FountainStoreRemoteCredentialProvisionTransportError.receiptMismatch
+        }
+        return receipt
+    }
+}
+
+public enum FountainStoreRemoteCredentialProvisionTransportError: Error, Equatable, Sendable {
+    case invalidEndpoint
+    case invalidTimeout
+    case emptyCredential
+    case requestFailed
+    case invalidResponse
+    case httpStatus(Int)
+    case invalidReceipt
+    case receiptMismatch
 }
