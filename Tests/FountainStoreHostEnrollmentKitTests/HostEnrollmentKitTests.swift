@@ -5,6 +5,25 @@ import CryptoKit
 final class HostEnrollmentKitTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000)
 
+    func testCredentialProvisionInstrumentHasStableFCISIdentityAndRedactedReceipt() throws {
+        XCTAssertEqual(FountainStoreCredentialProvisionInstrument.identity, "fountainstore.credential.provision")
+        XCTAssertEqual(FountainStoreCredentialProvisionInstrument.owningOrganization, "Fountain-Coach")
+        XCTAssertEqual(FountainStoreCredentialProvisionInstrument.owningKit, "FountainStoreHostEnrollmentKit")
+
+        let receipt = FountainStoreCredentialProvisionReceipt(
+            target: "https://store.example.test",
+            secretReference: SecretStoreReference(service: "com.fountain.store.http", account: "FS_API_KEY"),
+            state: .generatedAndStored,
+            credentialFingerprint: "sha256:fingerprint",
+            evidence: ["secretstore:stored", "credential:value-not-returned"])
+        XCTAssertTrue(receipt.terminal)
+        XCTAssertEqual(receipt.instrumentIdentity, FountainStoreCredentialProvisionInstrument.identity)
+        let encoded = String(decoding: try JSONEncoder().encode(receipt), as: UTF8.self)
+        XCTAssertFalse(encoded.localizedCaseInsensitiveContains("credentialValue"))
+        XCTAssertFalse(encoded.localizedCaseInsensitiveContains("privateKey"))
+        XCTAssertFalse(encoded.contains("secret-value"))
+    }
+
     private func makeService() -> DeterministicHostEnrollmentService {
         DeterministicHostEnrollmentService(policy: HostEnrollmentPolicy(
             target: "server:staging-1",
