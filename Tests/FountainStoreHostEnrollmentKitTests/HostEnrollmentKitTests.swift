@@ -25,6 +25,24 @@ private final class FixtureURLProtocol: URLProtocol {
 final class HostEnrollmentKitTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000)
 
+    func testMirrorReadIsAStableNamedChunkContract() throws {
+        let request = HostMirrorReadRequest(
+            target: "server:production",
+            hostIdentity: "fountainstore:production",
+            mirrorID: "fountain-coach-github-org",
+            relativePath: "Fountain-Store/refs/heads/main",
+            offset: 16,
+            length: 128,
+            idempotencyKey: "mirror-read-1",
+            expiresAt: Date(timeIntervalSince1970: 2_000))
+
+        let encoded = try JSONEncoder().encode(request)
+        let decoded = try JSONDecoder().decode(HostMirrorReadRequest.self, from: encoded)
+        XCTAssertEqual(decoded, request)
+        XCTAssertEqual(HostAgentRequest.Operation.mirrorRead.rawValue, "mirror-read")
+        XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains("/mnt/"))
+    }
+
     private struct FixtureValueProvider: FountainStoreCredentialValueProvider {
         let values: [String: Data]
         func retrieve(_ reference: SecretStoreReference) async throws -> Data {

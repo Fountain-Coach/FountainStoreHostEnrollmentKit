@@ -232,6 +232,7 @@ public struct SignedBootstrapDescriptor: Codable, Equatable, Sendable {
 public struct HostAgentRequest: Codable, Equatable, Sendable {
     public enum Operation: String, Codable, Sendable {
         case status
+        case mirrorRead = "mirror-read"
         case install
         case rollback
         case rotate
@@ -259,6 +260,75 @@ public struct HostAgentRequest: Codable, Equatable, Sendable {
         self.idempotencyKey = idempotencyKey
         self.expiresAt = expiresAt
     }
+}
+
+/// A read-only request for one named mirror entry. `mirrorID` is resolved by the
+/// host configuration; `relativePath` is never interpreted as an absolute path.
+/// The request carries no filesystem root and cannot select a second authority.
+public struct HostMirrorReadRequest: Codable, Equatable, Sendable {
+    public let target: String
+    public let hostIdentity: String
+    public let mirrorID: String
+    public let relativePath: String
+    public let offset: UInt64
+    public let length: UInt64
+    public let idempotencyKey: String
+    public let expiresAt: Date
+
+    public init(target: String, hostIdentity: String, mirrorID: String, relativePath: String,
+                offset: UInt64 = 0, length: UInt64,
+                idempotencyKey: String, expiresAt: Date) {
+        self.target = target
+        self.hostIdentity = hostIdentity
+        self.mirrorID = mirrorID
+        self.relativePath = relativePath
+        self.offset = offset
+        self.length = length
+        self.idempotencyKey = idempotencyKey
+        self.expiresAt = expiresAt
+    }
+}
+
+public struct HostMirrorReadReceipt: Codable, Equatable, Sendable {
+    public let operation: HostAgentRequest.Operation
+    public let target: String
+    public let hostIdentity: String
+    public let mirrorID: String
+    public let relativePath: String
+    public let offset: UInt64
+    public let length: UInt64
+    public let totalBytes: UInt64
+    public let chunkDigest: String
+    public let mirrorDigest: String
+    public let bytes: Data
+    public let complete: Bool
+    public let evidence: [String]
+
+    public init(target: String, hostIdentity: String, mirrorID: String, relativePath: String,
+                offset: UInt64, length: UInt64, totalBytes: UInt64,
+                chunkDigest: String, mirrorDigest: String, bytes: Data,
+                complete: Bool, evidence: [String] = []) {
+        self.operation = .mirrorRead
+        self.target = target
+        self.hostIdentity = hostIdentity
+        self.mirrorID = mirrorID
+        self.relativePath = relativePath
+        self.offset = offset
+        self.length = length
+        self.totalBytes = totalBytes
+        self.chunkDigest = chunkDigest
+        self.mirrorDigest = mirrorDigest
+        self.bytes = bytes
+        self.complete = complete
+        self.evidence = evidence
+    }
+}
+
+/// Host-owned source authority for a named mirror. The host resolves `mirrorID`
+/// to its configured storage root and validates the relative path and range.
+/// The kit deliberately does not perform filesystem access.
+public protocol HostMirrorReader: Sendable {
+    func read(_ request: HostMirrorReadRequest) async throws -> HostMirrorReadReceipt
 }
 
 public struct HostAgentReceipt: Codable, Equatable, Sendable {
@@ -326,6 +396,9 @@ public actor DeterministicHostAgentTransport: HostAgentTransport {
 
         switch request.operation {
         case .status:
+            guard state != .revoked else { throw HostAgentTransportRefusal.revoked }
+            state = .ready
+        case .mirrorRead:
             guard state != .revoked else { throw HostAgentTransportRefusal.revoked }
             state = .ready
         case .install:
