@@ -55,6 +55,85 @@ final class HostEnrollmentKitTests: XCTestCase {
         }
     }
 
+    private struct FixtureGoldenKeyDocumentProvider: FountainStoreGoldenKeyVaultDocumentValueProvider {
+        let document: Data
+        func retrieveDocument() async throws -> Data { document }
+    }
+
+    private actor FixtureGoldenKeySeedTransport: FountainStoreGoldenKeyVaultDocumentSeedTransport {
+        let document: Data
+        var receivedDocument: Data?
+        var receivedHostCredential: Data?
+
+        init(document: Data) { self.document = document }
+
+        func seed(_ request: FountainStoreGoldenKeyVaultDocumentSeedRequest,
+                  document: Data, hostCredential: Data) async throws
+            -> FountainStoreGoldenKeyVaultDocumentSeedReceipt {
+            receivedDocument = document
+            receivedHostCredential = hostCredential
+            return FountainStoreGoldenKeyVaultDocumentSeedReceipt(
+                request: request, state: .seeded,
+                evidence: ["golden-key:encrypted-document-stored"])
+        }
+
+        func values() -> (Data?, Data?) { (receivedDocument, receivedHostCredential) }
+    }
+
+    func testGoldenKeyDocumentSeederSendsCiphertextOnlyAndReturnsRedactedReceipt() async throws {
+        let document = Data("ciphertext-fixture-123".utf8)
+        let hostCredential = Data("host-credential".utf8)
+        let transport = FixtureGoldenKeySeedTransport(document: document)
+        let digest = SHA256.hash(data: document).map { String(format: "%02x", $0) }.joined()
+        let request = FountainStoreGoldenKeyVaultDocumentSeedRequest(
+            target: "server:production",
+            hostIdentity: "fountainstore:production",
+            vaultID: "vault",
+            documentReference: SecretStoreReference(service: "fountain-coach", account: "golden-key-document"),
+            documentDigest: "sha256:\(digest)", documentByteCount: document.count,
+            idempotencyKey: "seed-1", expiresAt: Date().addingTimeInterval(60))
+        let seeder = FountainStoreGoldenKeyVaultDocumentSeeder(
+            documentProvider: FixtureGoldenKeyDocumentProvider(document: document),
+            hostCredentialProvider: FixtureGoldenKeyHostCredentialProvider(credential: hostCredential),
+            transport: transport)
+
+        let receipt = await seeder.seed(request)
+        XCTAssertEqual(receipt.state, .seeded)
+        XCTAssertTrue(receipt.evidence.contains("golden-key:encrypted-document-stored"))
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(receipt), as: UTF8.self)
+            .contains(String(decoding: document, as: UTF8.self)))
+        let values = await transport.values()
+        XCTAssertEqual(values.0, document)
+        XCTAssertEqual(values.1, hostCredential)
+    }
+
+    func testGoldenKeyDocumentSeederRefusesDigestMismatchAndExpiredRequest() async throws {
+        let document = Data("encrypted-document".utf8)
+        let transport = FixtureGoldenKeySeedTransport(document: document)
+        let request = FountainStoreGoldenKeyVaultDocumentSeedRequest(
+            target: "server:production", hostIdentity: "fountainstore:production", vaultID: "vault",
+            documentReference: SecretStoreReference(service: "fountain-coach", account: "golden-key-document"),
+            documentDigest: "sha256:wrong", documentByteCount: document.count,
+            idempotencyKey: "seed-2", expiresAt: Date().addingTimeInterval(60))
+        let seeder = FountainStoreGoldenKeyVaultDocumentSeeder(
+            documentProvider: FixtureGoldenKeyDocumentProvider(document: document),
+            hostCredentialProvider: FixtureGoldenKeyHostCredentialProvider(credential: Data("host".utf8)),
+            transport: transport)
+
+        let mismatch = await seeder.seed(request)
+        XCTAssertEqual(mismatch.state, .refused)
+        XCTAssertTrue(mismatch.evidence.contains("golden-key:document-digest-mismatch"))
+
+        let expired = FountainStoreGoldenKeyVaultDocumentSeedRequest(
+            target: request.target, hostIdentity: request.hostIdentity, vaultID: request.vaultID,
+            documentReference: request.documentReference, documentDigest: request.documentDigest,
+            documentByteCount: request.documentByteCount, idempotencyKey: "seed-3",
+            expiresAt: Date().addingTimeInterval(-1))
+        let expiredReceipt = await seeder.seed(expired)
+        XCTAssertEqual(expiredReceipt.state, .refused)
+        XCTAssertTrue(expiredReceipt.evidence.contains("golden-key:seed-request-invalid"))
+    }
+
     func testGoldenKeyDocumentReadKeepsUnlockMaterialOutsideTheRemoteContract() async throws {
         let document = Data("encrypted-golden-key-document".utf8)
         let hostCredential = Data("host-agent-credential".utf8)
