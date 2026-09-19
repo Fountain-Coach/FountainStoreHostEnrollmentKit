@@ -25,6 +25,129 @@ private final class FixtureURLProtocol: URLProtocol {
 final class HostEnrollmentKitTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_000)
 
+    private struct FixtureGoldenKeyHostCredentialProvider: FountainStoreGoldenKeyVaultHostCredentialProvider {
+        let credential: Data
+        func retrieveHostCredential() async throws -> Data { credential }
+    }
+
+    private actor FixtureGoldenKeyTransport: FountainStoreGoldenKeyVaultDocumentReadTransport {
+        let document: Data
+        var receivedCredential: Data?
+
+        init(document: Data) { self.document = document }
+
+        func credential() -> Data? { receivedCredential }
+
+        func read(_ request: FountainStoreGoldenKeyVaultDocumentReadRequest,
+                  hostCredential: Data) async throws
+            -> (document: Data, receipt: FountainStoreGoldenKeyVaultDocumentReadReceipt) {
+            receivedCredential = hostCredential
+            let digest = SHA256.hash(data: document).map { String(format: "%02x", $0) }.joined()
+            return (document, FountainStoreGoldenKeyVaultDocumentReadReceipt(
+                target: request.target,
+                hostIdentity: request.hostIdentity,
+                vaultID: request.vaultID,
+                documentReference: request.documentReference,
+                documentDigest: "sha256:\(digest)",
+                documentByteCount: document.count,
+                state: .remoteRead,
+                evidence: ["golden-key:encrypted-document"]))
+        }
+    }
+
+    func testGoldenKeyDocumentReadKeepsUnlockMaterialOutsideTheRemoteContract() async throws {
+        let document = Data("encrypted-golden-key-document".utf8)
+        let hostCredential = Data("host-agent-credential".utf8)
+        let transport = FixtureGoldenKeyTransport(document: document)
+        let reader = FountainStoreGoldenKeyVaultDocumentReader(
+            hostCredentialProvider: FixtureGoldenKeyHostCredentialProvider(credential: hostCredential),
+            transport: transport)
+        let request = FountainStoreGoldenKeyVaultDocumentReadRequest(
+            target: "server:production",
+            hostIdentity: "fountainstore:production",
+            vaultID: "estate-publication-vault",
+            documentReference: SecretStoreReference(service: "fountain-coach", account: "golden-key-document"),
+            idempotencyKey: "golden-key-read-1",
+            expiresAt: Date().addingTimeInterval(60))
+
+        let result = await reader.read(request)
+        XCTAssertEqual(result.document, document)
+        XCTAssertEqual(result.receipt.state, .remoteRead)
+        XCTAssertTrue(result.receipt.evidence.contains("golden-key:encrypted-document"))
+        XCTAssertFalse(String(decoding: try JSONEncoder().encode(result.receipt), as: UTF8.self)
+            .contains("encrypted-golden-key-document"))
+        let receivedCredential = await transport.credential()
+        XCTAssertEqual(receivedCredential, hostCredential)
+    }
+
+    func testGoldenKeyDocumentReadRefusesExpiredRequestBeforeHostAccess() async throws {
+        let transport = FixtureGoldenKeyTransport(document: Data("document".utf8))
+        let reader = FountainStoreGoldenKeyVaultDocumentReader(
+            hostCredentialProvider: FixtureGoldenKeyHostCredentialProvider(credential: Data("host".utf8)),
+            transport: transport)
+        let request = FountainStoreGoldenKeyVaultDocumentReadRequest(
+            target: "server:production",
+            hostIdentity: "fountainstore:production",
+            vaultID: "vault",
+            documentReference: SecretStoreReference(service: "fountain-coach", account: "document"),
+            idempotencyKey: "expired",
+            expiresAt: now.addingTimeInterval(-1))
+
+        let result = await reader.read(request)
+        XCTAssertNil(result.document)
+        XCTAssertEqual(result.receipt.state, .refused)
+        let receivedCredential = await transport.credential()
+        XCTAssertNil(receivedCredential)
+    }
+
+    func testGoldenKeyDocumentReadURLSessionTransportUsesOpaqueRequestAndRedactedReceipt() async throws {
+        let document = Data("encrypted-document".utf8)
+        let hostCredential = Data("host-secret".utf8)
+        let reference = SecretStoreReference(service: "fountain-coach", account: "golden-key-document")
+        let request = FountainStoreGoldenKeyVaultDocumentReadRequest(
+            target: "server:production",
+            hostIdentity: "fountainstore:production",
+            vaultID: "vault",
+            documentReference: reference,
+            idempotencyKey: "urlsession-read-1",
+            expiresAt: now.addingTimeInterval(60))
+        let digest = SHA256.hash(data: document).map { String(format: "%02x", $0) }.joined()
+        let receipt = FountainStoreGoldenKeyVaultDocumentReadReceipt(
+            target: request.target,
+            hostIdentity: request.hostIdentity,
+            vaultID: request.vaultID,
+            documentReference: reference,
+            documentDigest: "sha256:\(digest)",
+            documentByteCount: document.count,
+            state: .remoteRead,
+            evidence: ["golden-key:encrypted-document"])
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [FixtureURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        FixtureURLProtocol.handler = { urlRequest in
+            XCTAssertEqual(urlRequest.url?.path, "/agent/v1/golden-key-vault/read")
+            XCTAssertEqual(urlRequest.httpMethod, "POST")
+            XCTAssertEqual(urlRequest.value(forHTTPHeaderField: FountainStoreGoldenKeyVaultDocumentReadURLSessionTransport.hostCredentialHeader), hostCredential.base64EncodedString())
+            let body = String(decoding: urlRequest.httpBody ?? Data(), as: UTF8.self)
+            XCTAssertFalse(body.contains("host-secret"))
+            let envelope = try! JSONEncoder().encode(Envelope(receipt: receipt, document: document))
+            return (HTTPURLResponse(url: urlRequest.url!, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, envelope)
+        }
+        defer { FixtureURLProtocol.handler = nil }
+
+        let transport = try FountainStoreGoldenKeyVaultDocumentReadURLSessionTransport(
+            endpoint: URL(string: "https://store.example.test/agent/v1/golden-key-vault/read")!, session: session)
+        let result = try await transport.read(request, hostCredential: hostCredential)
+        XCTAssertEqual(result.document, document)
+        XCTAssertEqual(result.receipt, receipt)
+    }
+
+    private struct Envelope: Codable {
+        let receipt: FountainStoreGoldenKeyVaultDocumentReadReceipt
+        let document: Data
+    }
+
     func testMirrorReadIsAStableNamedChunkContract() throws {
         let request = HostMirrorReadRequest(
             target: "server:production",
