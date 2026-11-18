@@ -1,5 +1,7 @@
 # FountainStoreHostEnrollmentKit
 
+> **FCIS architecture:** The [FCIS standalone Go stack specification](https://github.com/Fountain-Coach/.github/blob/main/FCIS-STACK.md) establishes the owner/Host enrollment and capability authority target. This repository continues to own its versioned Host enrollment contracts and fixtures; their existence does not imply production admission or a Swift dependency for FCIS Go.
+
 Provider-neutral FCIS-KIT contracts and deterministic lifecycle fixture for Chapter 97 host bootstrap and enrollment.
 
 The package also owns the FCIS-KIT instrument contracts `fountainstore.credential.provision` (v0.2.0) and
